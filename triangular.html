@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Periodic L-Shape Cellular Automaton</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #f5f5f5;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+    gap: 20px;
+  }
+  .panel {
+    background: white;
+    padding: 20px;
+    border-radius: 16px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    width: 420px;
+  }
+  canvas {
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+    cursor: pointer;
+  }
+  #vizWrap {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .vizBlock {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .vizLabel {
+    font-size: 13px;
+    color: #444;
+  }
+  button { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<h2>Periodic L-Shape Cellular Automaton</h2>
+
+<div class="panel">
+  <div>
+    <label>Width: <span id="widthLabel">10</span></label><br>
+    <input type="range" id="widthSlider" min="3" max="30" value="10" />
+  </div>
+
+  <div id="periodInfo" style="margin-top:10px;color:#0066cc;"></div>
+
+  <div style="margin-top:15px; display:flex; gap:15px;">
+    <div>
+      Color 0: <input type="color" id="color0" value="#00ffff" />
+    </div>
+    <div>
+      Color 1: <input type="color" id="color1" value="#ff7f00" />
+    </div>
+    <div>
+      L Highlight: <input type="color" id="highlightColor" value="#000000" />
+    </div>
+  </div>
+
+  <div style="margin-top:15px; display:flex; flex-direction:column; gap:8px;">
+    <button id="resetBtn">Reset (R)</button>
+    <button id="saveBtn">Save as PNG (S)</button>
+    <button id="exportRowBtn">Export Top Row (E)</button>
+    <button id="animateBtn">Animate One Full Period (A)</button>
+    <label style="font-size:13px;color:#333;">
+      <input type="checkbox" id="torusSpinToggle" checked />
+      Rotate 3D torus
+    </label>
+    <button id="exploreBtn">Explore All Initial Rows</button>
+    <div id="exploreOutput" style="font-size:12px;color:#444;max-height:150px;overflow:auto;"></div>
+    <span style="font-size:12px;color:#666;">Click a top-row hexagon to toggle cells</span>
+    <span style="font-size:12px;color:#666;">Click a torus tile to highlight its L-shape</span>
+    <span style="font-size:12px;color:#666;">Keyboard: R reset · S save · E export · A animate</span>
+  </div>
+</div>
+
+<div id="vizWrap">
+  <div class="vizBlock">
+    <div class="vizLabel">Automaton Grid</div>
+    <canvas id="canvas"></canvas>
+  </div>
+  <div class="vizBlock">
+    <div class="vizLabel">One Full Period on Torus (3D)</div>
+    <canvas id="torusCanvas" width="520" height="520"></canvas>
+  </div>
+</div>
+
+<h3>Period Histogram (from Explore)</h3>
+<canvas id="histogram"></canvas>
+
+<script>
+const CELL_SIZE = 12;
+const MAX_ROWS = 1024;
+const TRI_DY = Math.sqrt(3) / 2;
+const TRI_MARGIN = 8;
+const HEX_RADIUS = CELL_SIZE / Math.sqrt(3);
+const TORUS_MAJOR_RADIUS = 140;
+const TORUS_MINOR_RADIUS = 62;
+
+let width = 10;
+let baseRowInt = 0;   // row stored as 32-bit integer
+let grid = [];
+let repeatInfo = null;
+let animationInterval = null;
+let histogramData = {};
+let torusPatches = [];
+let torusPeriodRows = 0;
+let torusAngle = 0;
+let torusAnimationEnabled = true;
+let projectedTorusPatches = [];
+let selectedTorusTile = null;
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const torusCanvas = document.getElementById("torusCanvas");
+const torusCtx = torusCanvas.getContext("2d");
+const histCanvas = document.getElementById("histogram");
+const histCtx = histCanvas.getContext("2d");
+
+function maskForWidth(w) {
+  return (1 << w) - 1;
+}
+
+// Linear map over F2:
+// next = x XOR (x shifted right cyclically by 1)
+function nextRowInt(x) {
+  const right = ((x >>> 1) | ((x & 1) << (width - 1))) & maskForWidth(width);
+  return (x ^ right) & maskForWidth(width);
+}
+
+function intToRowArray(x) {
+  const arr = [];
+  for (let i = 0; i < width; i++) {
+    arr.push((x >> i) & 1);
+  }
+  return arr;
+}
+
+// Period detection using hash map (linear algebra iteration)
+function recomputeFromInt(startInt) {
+  const seen = new Map();
+  grid = [];
+  repeatInfo = null;
+
+  let current = startInt;
+  let step = 0;
+
+  while (step < MAX_ROWS) {
+    if (seen.has(current)) {
+      const firstIndex = seen.get(current);
+      repeatInfo = {
+        firstIndex,
+        secondIndex: step,
+        period: step - firstIndex
+      };
+      grid.push(intToRowArray(current));
+      break;
+    }
+
+    seen.set(current, step);
+    grid.push(intToRowArray(current));
+    current = nextRowInt(current);
+    step++;
+  }
+
+  document.getElementById("periodInfo").textContent =
+    repeatInfo
+      ? `Period: ${repeatInfo.period} (rows ${repeatInfo.firstIndex} and ${repeatInfo.secondIndex})`
+      : "";
+
+  rebuildTorusCells();
+}
+
+function draw(highlightRow = null) {
+  const displayRows = repeatInfo ? repeatInfo.period : grid.length;
+  const height = Math.max(1, displayRows);
+  const xSpan = (width - 1) + 0.5 * (height - 1);
+  const ySpan = (height - 1) * TRI_DY;
+  canvas.width = Math.ceil(2 * TRI_MARGIN + 2 * HEX_RADIUS + CELL_SIZE * xSpan);
+  canvas.height = Math.ceil(2 * TRI_MARGIN + 2 * HEX_RADIUS + CELL_SIZE * ySpan);
+
+  const color0 = document.getElementById("color0").value;
+  const color1 = document.getElementById("color1").value;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  function latticeCenter(c, r) {
+    return {
+      x: TRI_MARGIN + HEX_RADIUS + CELL_SIZE * (c + 0.5 * r),
+      y: TRI_MARGIN + HEX_RADIUS + CELL_SIZE * TRI_DY * r
+    };
+  }
+
+  for (let r = 0; r < height; r++) {
+    for (let c = 0; c < width; c++) {
+      ctx.fillStyle = grid[r][c] ? color1 : color0;
+      const center = latticeCenter(c, r);
+      const verts = [];
+      for (let k = 0; k < 6; k++) {
+        const ang = (Math.PI / 6) + (k * Math.PI / 3);
+        verts.push({
+          x: center.x + HEX_RADIUS * Math.cos(ang),
+          y: center.y + HEX_RADIUS * Math.sin(ang)
+        });
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(verts[0].x, verts[0].y);
+      for (let k = 1; k < 6; k++) ctx.lineTo(verts[k].x, verts[k].y);
+      ctx.closePath();
+      ctx.fill();
+
+      if (
+        (repeatInfo && (r === repeatInfo.firstIndex || r === repeatInfo.secondIndex)) ||
+        r === highlightRow
+      ) {
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = "red";
+      } else {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "gray";
+      }
+
+      ctx.stroke();
+    }
+  }
+}
+
+function rebuildTorusCells() {
+  torusPatches = [];
+  torusPeriodRows = 0;
+  if (grid.length === 0) return;
+
+  const start = repeatInfo ? repeatInfo.firstIndex : 0;
+  const end = repeatInfo ? repeatInfo.secondIndex : grid.length;
+  const rows = grid.slice(start, end);
+  const periodRows = rows.length;
+  if (periodRows === 0) return;
+  torusPeriodRows = periodRows;
+
+  const hexOffsets = [];
+  for (let k = 0; k < 6; k++) {
+    const ang = (Math.PI / 6) + (k * Math.PI / 3);
+    const dx = (HEX_RADIUS * Math.cos(ang)) / CELL_SIZE;
+    const dy = (HEX_RADIUS * Math.sin(ang)) / CELL_SIZE;
+    const dr = dy / TRI_DY;
+    const dc = dx - 0.5 * dr;
+    hexOffsets.push({ dc, dr });
+  }
+
+  function torusPoint(u, v) {
+    return {
+      x: (TORUS_MAJOR_RADIUS + TORUS_MINOR_RADIUS * Math.cos(v)) * Math.cos(u),
+      y: (TORUS_MAJOR_RADIUS + TORUS_MINOR_RADIUS * Math.cos(v)) * Math.sin(u),
+      z: TORUS_MINOR_RADIUS * Math.sin(v)
+    };
+  }
+
+  for (let r = 0; r < periodRows; r++) {
+    const row = rows[r];
+    for (let c = 0; c < width; c++) {
+      const centerC = c;
+      const centerR = r;
+      torusPatches.push({
+        r,
+        c,
+        centerC,
+        centerR,
+        bit: row[c],
+        corners: hexOffsets.map(({ dc, dr }) => {
+          const lc = centerC + dc;
+          const lr = centerR + dr;
+          const u = (lr / periodRows) * Math.PI * 2;
+          const v = (lc / width) * Math.PI * 2;
+          return torusPoint(u, v);
+        })
+      });
+    }
+  }
+}
+
+function drawTorusFrame() {
+  const w = torusCanvas.width;
+  const h = torusCanvas.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  torusCtx.clearRect(0, 0, w, h);
+  torusCtx.fillStyle = "#ffffff";
+  torusCtx.fillRect(0, 0, w, h);
+
+  const color0 = document.getElementById("color0").value;
+  const color1 = document.getElementById("color1").value;
+
+  const yaw = torusAngle;
+  const pitch = -0.55;
+  const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+  const cosX = Math.cos(pitch), sinX = Math.sin(pitch);
+  const cameraDist = 540;
+  const focal = 430;
+  const highlightColor = document.getElementById("highlightColor").value;
+
+  function torusPoint(u, v) {
+    return {
+      x: (TORUS_MAJOR_RADIUS + TORUS_MINOR_RADIUS * Math.cos(v)) * Math.cos(u),
+      y: (TORUS_MAJOR_RADIUS + TORUS_MINOR_RADIUS * Math.cos(v)) * Math.sin(u),
+      z: TORUS_MINOR_RADIUS * Math.sin(v)
+    };
+  }
+
+  function torusNormal(u, v) {
+    return {
+      x: Math.cos(v) * Math.cos(u),
+      y: Math.cos(v) * Math.sin(u),
+      z: Math.sin(v)
+    };
+  }
+
+  function projectPoint(pt) {
+    const x1 = pt.x * cosY + pt.z * sinY;
+    const z1 = -pt.x * sinY + pt.z * cosY;
+    const y1 = pt.y;
+
+    const y2 = y1 * cosX - z1 * sinX;
+    const z2 = y1 * sinX + z1 * cosX;
+    const x2 = x1;
+
+    const depth = cameraDist - z2;
+    const scale = focal / Math.max(1, depth);
+
+    return {
+      sx: cx + x2 * scale,
+      sy: cy + y2 * scale,
+      z: z2
+    };
+  }
+
+  function rotateVector(vec) {
+    const x1 = vec.x * cosY + vec.z * sinY;
+    const z1 = -vec.x * sinY + vec.z * cosY;
+    const y1 = vec.y;
+    const y2 = y1 * cosX - z1 * sinX;
+    const z2 = y1 * sinX + z1 * cosX;
+    return { x: x1, y: y2, z: z2 };
+  }
+
+  function parseHexColor(hex) {
+    let h = hex.replace("#", "");
+    if (h.length === 3) h = h.split("").map(ch => ch + ch).join("");
+    return {
+      r: parseInt(h.slice(0, 2), 16),
+      g: parseInt(h.slice(2, 4), 16),
+      b: parseInt(h.slice(4, 6), 16)
+    };
+  }
+
+  function shadeColor(hex, factor) {
+    const base = parseHexColor(hex);
+    const clamp = (v) => Math.max(0, Math.min(255, Math.round(v)));
+    return `rgb(${clamp(base.r * factor)},${clamp(base.g * factor)},${clamp(base.b * factor)})`;
+  }
+
+  const projectedPatches = torusPatches.map(patch => {
+    const corners = patch.corners.map(projectPoint);
+    const avgZ = corners.reduce((acc, p) => acc + p.z, 0) / corners.length;
+    const sortZ = Math.max(...corners.map(p => p.z));
+    const centerU = (patch.centerR / torusPeriodRows) * Math.PI * 2;
+    const centerV = (patch.centerC / width) * Math.PI * 2;
+    const normal = rotateVector(torusNormal(centerU, centerV));
+    const lightDir = { x: -0.35, y: -0.2, z: 0.92 };
+    const dot = normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z;
+    const intensity = Math.max(0.7, Math.min(1.1, 0.86 + 0.22 * dot));
+    return { corners, avgZ, sortZ, bit: patch.bit, r: patch.r, c: patch.c, intensity, facing: normal.z };
+  });
+
+  projectedPatches.sort((a, b) => a.sortZ - b.sortZ);
+  projectedTorusPatches = projectedPatches;
+  const zMin = projectedPatches.length ? projectedPatches[0].sortZ : 0;
+  const zMax = projectedPatches.length ? projectedPatches[projectedPatches.length - 1].sortZ : 1;
+
+  for (const patch of projectedPatches) {
+    const centerX = patch.corners.reduce((acc, p) => acc + p.sx, 0) / patch.corners.length;
+    const centerY = patch.corners.reduce((acc, p) => acc + p.sy, 0) / patch.corners.length;
+    // Slight overlap hides anti-aliased cracks so back tiles are less visible.
+    const expanded = patch.corners.map(c => ({
+      sx: centerX + (c.sx - centerX) * 1.08,
+      sy: centerY + (c.sy - centerY) * 1.08
+    }));
+
+    torusCtx.beginPath();
+    torusCtx.moveTo(expanded[0].sx, expanded[0].sy);
+    for (let i = 1; i < expanded.length; i++) torusCtx.lineTo(expanded[i].sx, expanded[i].sy);
+    torusCtx.closePath();
+    const baseColor = patch.bit ? color1 : color0;
+    const shaded = shadeColor(baseColor, patch.intensity);
+    torusCtx.fillStyle = shaded;
+    torusCtx.fill();
+    // Seal seams with the same color to avoid any perceived translucency.
+    torusCtx.strokeStyle = shaded;
+    torusCtx.lineWidth = 1.4;
+    torusCtx.stroke();
+  }
+
+  for (const patch of projectedPatches) {
+    if (patch.facing < 0.05) continue;
+    const depthT = (patch.sortZ - zMin) / ((zMax - zMin) || 1);
+    const lineAlpha = 0.35 + 0.65 * depthT;
+    torusCtx.beginPath();
+    torusCtx.moveTo(patch.corners[0].sx, patch.corners[0].sy);
+    for (let i = 1; i < patch.corners.length; i++) torusCtx.lineTo(patch.corners[i].sx, patch.corners[i].sy);
+    torusCtx.closePath();
+    torusCtx.strokeStyle = `rgba(35,35,35,${lineAlpha})`;
+    torusCtx.lineWidth = 1;
+    torusCtx.stroke();
+  }
+
+  if (selectedTorusTile && width > 0 && torusPeriodRows > 0) {
+    const mod = (n, m) => ((n % m) + m) % m;
+    const selected = new Set();
+    const r = mod(selectedTorusTile.r, torusPeriodRows);
+    const c = mod(selectedTorusTile.c, width);
+    selected.add(`${r},${c}`);
+    selected.add(`${mod(r + 1, torusPeriodRows)},${c}`);
+    selected.add(`${r},${mod(c + 1, width)}`);
+
+    const patchByKey = new Map(projectedPatches.map(p => [`${p.r},${p.c}`, p]));
+    const edgeUse = new Map();
+    function vKey(v) {
+      return `${Math.round(v.sx * 10) / 10},${Math.round(v.sy * 10) / 10}`;
+    }
+
+    torusCtx.strokeStyle = highlightColor;
+    torusCtx.lineWidth = 4;
+    torusCtx.lineCap = "round";
+    torusCtx.lineJoin = "round";
+    for (const key of selected) {
+      const patch = patchByKey.get(key);
+      if (!patch) continue;
+      for (let i = 0; i < patch.corners.length; i++) {
+        const a = patch.corners[i];
+        const b = patch.corners[(i + 1) % patch.corners.length];
+        const ka = vKey(a);
+        const kb = vKey(b);
+        const edgeKey = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+        const prev = edgeUse.get(edgeKey);
+        if (prev) {
+          prev.count += 1;
+        } else {
+          edgeUse.set(edgeKey, { count: 1, a, b });
+        }
+      }
+    }
+    for (const e of edgeUse.values()) {
+      if (e.count !== 1) continue;
+      torusCtx.beginPath();
+      torusCtx.moveTo(e.a.sx, e.a.sy);
+      torusCtx.lineTo(e.b.sx, e.b.sy);
+      torusCtx.stroke();
+    }
+  }
+
+  torusCtx.fillStyle = "#444";
+  torusCtx.font = "12px Arial";
+  torusCtx.fillText(`Grid: ${width} x ${torusPeriodRows}`, 12, 20);
+}
+
+function animateTorus() {
+  if (torusAnimationEnabled) torusAngle += 0.01;
+  drawTorusFrame();
+  requestAnimationFrame(animateTorus);
+}
+
+function drawHistogram() {
+  histCanvas.width = 600;
+  histCanvas.height = 300;
+  histCtx.clearRect(0, 0, histCanvas.width, histCanvas.height);
+
+  const periods = Object.keys(histogramData).map(p => parseInt(p)).sort((a,b)=>a-b);
+  if (periods.length === 0) return;
+
+  const maxCount = Math.max(...Object.values(histogramData));
+  const barWidth = histCanvas.width / periods.length;
+
+  periods.forEach((p, i) => {
+    const count = histogramData[p];
+    const barHeight = (count / maxCount) * (histCanvas.height - 40);
+    histCtx.fillStyle = "steelblue";
+    histCtx.fillRect(i * barWidth, histCanvas.height - barHeight, barWidth - 2, barHeight);
+    histCtx.fillStyle = "black";
+    histCtx.fillText(p, i * barWidth + 4, histCanvas.height - 5);
+  });
+}
+
+function pointInPolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i].sx, yi = points[i].sy;
+    const xj = points[j].sx, yj = points[j].sy;
+    const crosses = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / ((yj - yi) || 1e-9) + xi);
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  for (let col = 0; col < width; col++) {
+    const center = {
+      sx: TRI_MARGIN + HEX_RADIUS + CELL_SIZE * col,
+      sy: TRI_MARGIN + HEX_RADIUS
+    };
+    const hex = [];
+    for (let k = 0; k < 6; k++) {
+      const ang = (Math.PI / 6) + (k * Math.PI / 3);
+      hex.push({
+        sx: center.sx + HEX_RADIUS * Math.cos(ang),
+        sy: center.sy + HEX_RADIUS * Math.sin(ang)
+      });
+    }
+    if (!pointInPolygon(x, y, hex)) continue;
+
+    baseRowInt ^= (1 << col);
+    recomputeFromInt(baseRowInt);
+    draw();
+    break;
+  }
+});
+
+torusCanvas.addEventListener("click", (e) => {
+  const rect = torusCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  let hit = null;
+  for (let i = projectedTorusPatches.length - 1; i >= 0; i--) {
+    const patch = projectedTorusPatches[i];
+    if (pointInPolygon(x, y, patch.corners)) {
+      hit = patch;
+      break;
+    }
+  }
+
+  if (hit) {
+    selectedTorusTile = { r: hit.r, c: hit.c };
+  } else {
+    selectedTorusTile = null;
+  }
+  drawTorusFrame();
+});
+
+// Width slider
+
+document.getElementById("widthSlider").addEventListener("input", (e) => {
+  width = parseInt(e.target.value);
+  document.getElementById("widthLabel").textContent = width;
+  baseRowInt = 0;
+  histogramData = {};
+  recomputeFromInt(baseRowInt);
+  draw();
+  drawHistogram();
+});
+
+// Reset
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  baseRowInt = 0;
+  recomputeFromInt(baseRowInt);
+  draw();
+});
+
+// Save PNG
+
+document.getElementById("saveBtn").addEventListener("click", () => {
+  const link = document.createElement("a");
+  link.download = "automaton.png";
+  link.href = canvas.toDataURL();
+  link.click();
+});
+
+// Export top row
+
+document.getElementById("exportRowBtn").addEventListener("click", () => {
+  const binary = intToRowArray(baseRowInt).join("");
+  alert("Top row (binary): " + binary);
+});
+
+// Animate
+
+document.getElementById("animateBtn").addEventListener("click", () => {
+  if (!repeatInfo) return;
+  if (animationInterval) clearInterval(animationInterval);
+
+  let current = repeatInfo.firstIndex;
+  animationInterval = setInterval(() => {
+    draw(current);
+    current++;
+    if (current > repeatInfo.secondIndex) {
+      clearInterval(animationInterval);
+      draw();
+    }
+  }, 300);
+});
+
+// Explore
+
+document.getElementById("exploreBtn").addEventListener("click", () => {
+  const output = document.getElementById("exploreOutput");
+  output.innerHTML = "";
+  histogramData = {};
+
+  const total = 1 << width;
+  const limit = Math.min(total, 1024);
+
+  for (let mask = 0; mask < limit; mask++) {
+    recomputeFromInt(mask);
+    const period = repeatInfo ? repeatInfo.period : 0;
+    histogramData[period] = (histogramData[period] || 0) + 1;
+    output.innerHTML += `${mask.toString(2).padStart(width,'0')} → period ${period}<br>`;
+  }
+
+  output.innerHTML += `<br>Explored ${limit} of ${total} possible rows.`;
+  drawHistogram();
+});
+
+// Keyboard
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "r" || e.key === "R") {
+    baseRowInt = 0;
+    recomputeFromInt(baseRowInt);
+    draw();
+  }
+  if (e.key === "s" || e.key === "S") document.getElementById("saveBtn").click();
+  if (e.key === "e" || e.key === "E") document.getElementById("exportRowBtn").click();
+  if (e.key === "a" || e.key === "A") document.getElementById("animateBtn").click();
+});
+
+// Color updates
+
+document.getElementById("color0").addEventListener("input", () => draw());
+document.getElementById("color1").addEventListener("input", () => draw());
+document.getElementById("torusSpinToggle").addEventListener("change", (e) => {
+  torusAnimationEnabled = e.target.checked;
+  drawTorusFrame();
+});
+
+// Initial
+recomputeFromInt(baseRowInt);
+draw();
+drawHistogram();
+animateTorus();
+</script>
+
+</body>
+</html>
